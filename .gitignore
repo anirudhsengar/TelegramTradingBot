@@ -1,3 +1,6 @@
 .env
 session_name.session
 .txt
+.venv
+.vscode
+session_name.session-journal
