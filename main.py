@@ -4,7 +4,7 @@ import os
 import json
 import re
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 from azure.ai.inference import ChatCompletionsClient
@@ -56,6 +56,25 @@ llm_client = ChatCompletionsClient(
 
 telegram_client = TelegramClient('session_name', API_ID, API_HASH)
 processed_message_ids: deque[str] = deque(maxlen=MAX_TRACKED_MESSAGES)
+
+
+def _message_age_seconds(event) -> float:
+    """Compute message age accounting for Telethon's time offset if the system clock is skewed."""
+    msg_time = event.date
+    if not msg_time:
+        return 0.0
+    if msg_time.tzinfo is None:
+        msg_time = msg_time.replace(tzinfo=timezone.utc)
+
+    offset = 0
+    try:
+        sender = getattr(event._client, "_sender", None)
+        offset = getattr(sender, "time_offset", 0) or 0
+    except Exception:
+        offset = 0
+
+    now = datetime.now(timezone.utc) + timedelta(seconds=offset)
+    return (now - msg_time).total_seconds(), offset
 
 
 # --- MetaTrader 5 Logic ---
@@ -290,14 +309,16 @@ async def parse_trade_signal(text: str):
 
 async def handler(event):
     message_id = f"{event.chat_id}:{event.id}"
-    # Ignore stale messages to avoid replayed trades
-    if event.date:
-        msg_time = event.date
-        if msg_time.tzinfo is None:
-            msg_time = msg_time.replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - msg_time).total_seconds()
-        if age > STALE_MESSAGE_SECONDS:
-            logger.info(f"Skipping stale message {message_id} age={age}s")
+    # Ignore stale messages to avoid replayed trades (adjusted for Telethon time offset)
+    age, offset = _message_age_seconds(event)
+    if age > STALE_MESSAGE_SECONDS:
+        # If the server thinks our clock is badly skewed, don't drop; log and continue
+        if abs(offset) > 300:
+            logger.warning(
+                f"Clock skew detected (offset={offset}s); overriding stale guard for {message_id} age={age}s"
+            )
+        else:
+            logger.info(f"Skipping stale message {message_id} age={age}s (offset-adjusted)")
             return
 
     if message_id in processed_message_ids:
