@@ -75,8 +75,16 @@ It opens a tiny market order on `TEST_SYMBOL` (default `XAUUSD`) and closes it a
 - Keep system time synced; large clock skew may affect stale detection.
 - Protect your `.env` and `session_name.session` files; they contain credentials/tokens.
 
+## Disclaimer
+- No financial advice: this code is provided “as is” for your own use; you are responsible for all trading outcomes.
+- Test on demo accounts before live use; verify slippage, volume, and symbol settings match your broker.
+- Ensure use complies with your broker/API terms and local regulations; avoid capturing or redistributing Telegram PII/logs without consent.
+
 ## Files
 - `main.py` – Telegram listener, LLM-based signal parser, MT5 executor.
 - `get_ids.py` – interactive helper to print your dialog/chat IDs and create the Telethon session.
 - `smoke_test_mt5.py` – minimal MT5 round-trip sanity check.
 - `requirements.txt` – runtime dependencies.
+
+## License
+MIT License. See `LICENSE`.
