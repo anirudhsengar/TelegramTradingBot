@@ -55,14 +55,18 @@ llm_client = ChatCompletionsClient(
 )
 
 telegram_client = TelegramClient('session_name', API_ID, API_HASH)
-processed_message_ids: deque[str] = deque(maxlen=MAX_TRACKED_MESSAGES)
+# Track last seen text and parsed signal per message so we can react to edits safely
+message_state: dict[str, dict] = {}
+message_order: deque[str] = deque()
+recent_messages: dict[int, deque[dict]] = {}
 
 
-def _message_age_seconds(event) -> float:
+def _message_age_seconds(event) -> tuple[float, int]:
     """Compute message age accounting for Telethon's time offset if the system clock is skewed."""
-    msg_time = event.date
+    msg = getattr(event, "message", None)
+    msg_time = getattr(msg, "edit_date", None) or getattr(event, "date", None)
     if not msg_time:
-        return 0.0
+        return 0.0, 0
     if msg_time.tzinfo is None:
         msg_time = msg_time.replace(tzinfo=timezone.utc)
 
@@ -75,6 +79,68 @@ def _message_age_seconds(event) -> float:
 
     now = datetime.now(timezone.utc) + timedelta(seconds=offset)
     return (now - msg_time).total_seconds(), offset
+
+
+def _remember_message(message_id: str, text: str, signal: dict):
+    """Remember the last processed text/signal for a message id and prune old entries."""
+    if message_id in message_order:
+        message_order.remove(message_id)
+    message_order.append(message_id)
+    message_state[message_id] = {"text": text, "signal": signal}
+
+    while len(message_order) > MAX_TRACKED_MESSAGES:
+        old_id = message_order.popleft()
+        message_state.pop(old_id, None)
+
+
+def _detect_language(text: str) -> str:
+    """Very light language hint: detect Arabic characters; default to 'en'."""
+    if re.search(r"[\u0600-\u06FF]", text or ""):
+        return "ar"
+    return "en"
+
+
+def _remember_recent_message(chat_id: int, sender: str, text: str, timestamp: str):
+    """Keep a short rolling window of recent messages per chat for LLM context."""
+    window = recent_messages.setdefault(chat_id, deque(maxlen=5))
+    window.append({"sender": sender, "text": text, "ts": timestamp})
+
+
+def _get_recent_messages(chat_id: int, limit: int = 3):
+    window = recent_messages.get(chat_id)
+    if not window:
+        return []
+    return list(window)[-limit:]
+
+
+def _positions_snapshot(symbol_filter: str = "XAUUSD", max_items: int = 5):
+    """Lightweight view of this bot's positions for context. Does not modify trades."""
+    try:
+        positions = mt5.positions_get()
+    except Exception:
+        return []
+
+    if not positions:
+        return []
+
+    snapshot = []
+    for pos in positions:
+        if pos.magic != MAGIC_NUMBER:
+            continue
+        if symbol_filter and pos.symbol.upper() != symbol_filter.upper():
+            continue
+        snapshot.append({
+            "ticket": pos.ticket,
+            "symbol": pos.symbol,
+            "side": "buy" if pos.type == mt5.ORDER_TYPE_BUY else "sell",
+            "entry": pos.price_open,
+            "sl": pos.sl,
+            "tp": pos.tp,
+            "volume": pos.volume,
+        })
+        if len(snapshot) >= max_items:
+            break
+    return snapshot
 
 
 # --- MetaTrader 5 Logic ---
@@ -219,6 +285,95 @@ def close_trades_sync(symbol="XAUUSD"):
     
     logger.info(f"Closed {count} positions for {symbol}")
 
+
+def update_positions_sync(signal):
+    """Update SL/TP on existing positions when a Telegram message is edited."""
+    if not ensure_mt5_connection():
+        return
+
+    symbol = (signal.get("symbol") or "XAUUSD").upper()
+    side = signal.get("side")
+
+    raw_sl = signal.get("sl")
+    raw_tp = signal.get("tp")
+
+    if raw_sl in (None, "", 0, 0.0) and raw_tp in (None, "", 0, 0.0):
+        logger.info(f"No SL/TP update provided for {symbol}; skipping")
+        return
+
+    positions = mt5.positions_get(symbol=symbol)
+    if not positions:
+        logger.info(f"No open positions found for {symbol} to update")
+        return
+
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        logger.error(f"No tick data for {symbol}; cannot update positions")
+        return
+
+    requested_sl = float(raw_sl) if raw_sl not in (None, "", 0, 0.0) else None
+    requested_tp = float(raw_tp) if raw_tp not in (None, "", 0, 0.0) else None
+
+    updated = 0
+    for pos in positions:
+        if pos.magic != MAGIC_NUMBER:
+            continue
+
+        # Respect side if supplied; otherwise update all bot positions for the symbol
+        if side == "buy" and pos.type != mt5.ORDER_TYPE_BUY:
+            continue
+        if side == "sell" and pos.type != mt5.ORDER_TYPE_SELL:
+            continue
+
+        current_price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
+
+        target_sl = pos.sl if requested_sl is None else requested_sl
+        target_tp = pos.tp if requested_tp is None else requested_tp
+
+        if pos.type == mt5.ORDER_TYPE_BUY:
+            if target_sl and target_sl >= current_price:
+                logger.warning(f"SL {target_sl} not below current price {current_price} for BUY; keeping existing {pos.sl}")
+                target_sl = pos.sl
+            if target_tp and target_tp <= current_price:
+                logger.warning(f"TP {target_tp} not above current price {current_price} for BUY; keeping existing {pos.tp}")
+                target_tp = pos.tp
+        else:
+            if target_sl and target_sl <= current_price:
+                logger.warning(f"SL {target_sl} not above current price {current_price} for SELL; keeping existing {pos.sl}")
+                target_sl = pos.sl
+            if target_tp and target_tp >= current_price:
+                logger.warning(f"TP {target_tp} not below current price {current_price} for SELL; keeping existing {pos.tp}")
+                target_tp = pos.tp
+
+        if target_sl == pos.sl and target_tp == pos.tp:
+            logger.info(f"Position {pos.ticket} already has requested SL/TP; skipping")
+            continue
+
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": pos.ticket,
+            "symbol": symbol,
+            "sl": target_sl,
+            "tp": target_tp,
+            "deviation": DEVIATION,
+            "magic": MAGIC_NUMBER,
+            "comment": "Update SL/TP via edit",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+
+        result = mt5.order_send(request)
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error(f"Failed to update position {pos.ticket}: {result.comment}")
+        else:
+            logger.info(f"Updated position {pos.ticket} SL={target_sl} TP={target_tp}")
+            updated += 1
+
+    if updated == 0:
+        logger.info(f"No positions were updated for {symbol}")
+    else:
+        logger.info(f"Updated {updated} position(s) for {symbol}")
+
 # --- Async Wrappers ---
 
 async def open_position_async(signal):
@@ -232,6 +387,12 @@ async def close_positions_async(symbol):
     await asyncio.to_thread(close_trades_sync, symbol)
 
 
+async def update_positions_async(signal):
+    """Wraps SL/TP updates in a thread for edited Telegram messages."""
+    logger.info(f"Processing UPDATE signal: {signal}")
+    await asyncio.to_thread(update_positions_sync, signal)
+
+
 # --- Signal Processing ---
 
 def is_potential_trade_text(text: str) -> bool:
@@ -241,10 +402,10 @@ def is_potential_trade_text(text: str) -> bool:
     keywords = ("buy", "sell", "xau", "gold", "xauusd", "tp", "sl", "stop", "close", "profit")
     return any(k in text_lower for k in keywords)
 
-async def parse_trade_signal(text: str):
-    """Uses Azure AI Inference to extract structured trade data."""
+async def parse_trade_signal(text: str, context: dict):
+    """Uses Azure AI Inference to extract structured trade data with contextual hints."""
     prompt = (
-        "You are a financial trading assistant. Extract the trading instruction from the text. "
+        "You are a financial trading assistant. Extract the trading instruction from the provided JSON context. "
         "Return ONLY a compact JSON object with no markdown formatting. "
         "Schema: {\"action\": \"open|close|none\", "
         "\"symbol\": \"XAUUSD\" (default if Gold/XAU mentioned), "
@@ -254,7 +415,10 @@ async def parse_trade_signal(text: str):
         "1. If text implies closing positions (e.g., 'Close all', 'Close Gold'), set action='close'. "
         "2. If text implies entering a trade, set action='open'. "
         "3. If unclear or just chatter, set action='none'. "
-        "4. Convert all prices to pure numbers."
+        "4. Convert all prices to pure numbers. "
+        "5. Use language_hint to interpret the text. "
+        "6. Use recent_messages for follow-ups like updated TP/SL. "
+        "7. If positions show an existing bot trade on the symbol and the new text updates TP/SL, prefer action='open' with new tp/sl (the executor will update)."
     )
     
     def _extract_json_block(raw: str) -> str:
@@ -271,9 +435,10 @@ async def parse_trade_signal(text: str):
         return match.group(0) if match else cleaned
 
     try:
+        user_payload = json.dumps(context, ensure_ascii=False)
         response = await asyncio.to_thread(
             llm_client.complete,
-            messages=[SystemMessage(prompt), UserMessage(f"Message: {text}")],
+            messages=[SystemMessage(prompt), UserMessage(f"Context JSON:\n{user_payload}")],
             temperature=0.1,
             top_p=0.9,
             max_tokens=200,
@@ -309,6 +474,8 @@ async def parse_trade_signal(text: str):
 
 async def handler(event):
     message_id = f"{event.chat_id}:{event.id}"
+    is_edit = isinstance(event, events.MessageEdited.Event)
+
     # Ignore stale messages to avoid replayed trades (adjusted for Telethon time offset)
     age, offset = _message_age_seconds(event)
     if age > STALE_MESSAGE_SECONDS:
@@ -321,29 +488,59 @@ async def handler(event):
             logger.info(f"Skipping stale message {message_id} age={age}s (offset-adjusted)")
             return
 
-    if message_id in processed_message_ids:
-        logger.debug(f"Duplicate message {message_id} ignored")
-        return
-    processed_message_ids.append(message_id)
-
     sender = await event.get_sender()
     sender_name = getattr(sender, 'first_name', 'Unknown')
     text = event.text or ""
-    
-    logger.info(f"New Message from {sender_name}: {text}")
-    
-    if not is_potential_trade_text(text):
+
+    logger.info(f"{'Edited' if is_edit else 'New'} Message from {sender_name}: {text}")
+
+    last_state = message_state.get(message_id)
+    if last_state and last_state.get("text") == text:
+        logger.debug(f"Message {message_id} text unchanged; ignoring")
         return
 
-    signal = await parse_trade_signal(text)
+    if not is_potential_trade_text(text):
+        _remember_message(message_id, text, {"action": "none"})
+        _remember_recent_message(event.chat_id, sender_name, text, (event.message.edit_date or event.date).isoformat() if event.date else "")
+        return
+
+    context = {
+        "message": text,
+        "sender": {"name": sender_name, "id": getattr(sender, "id", None)},
+        "chat": {"id": event.chat_id, "type": "channel" if getattr(event, "is_channel", False) else "chat"},
+        "language_hint": _detect_language(text),
+        "recent_messages": _get_recent_messages(event.chat_id),
+        "positions": _positions_snapshot(symbol_filter="XAUUSD"),
+        "defaults": {
+            "default_symbol": "XAUUSD",
+            "fixed_volume": FIXED_VOLUME,
+            "magic_number": MAGIC_NUMBER,
+            "allowed_actions": ["open", "close", "update"],
+            "slippage_points": DEVIATION,
+        },
+        "time": {
+            "timestamp": (event.message.edit_date or event.date).isoformat() if event.date else "",
+            "message_age_seconds": age,
+            "stale_after_seconds": STALE_MESSAGE_SECONDS,
+            "time_offset_seconds": offset,
+        },
+    }
+
+    signal = await parse_trade_signal(text, context)
     action = signal.get("action")
-    
-    if action == "open":
+    prev_signal = last_state.get("signal") if last_state else None
+
+    if is_edit and prev_signal and prev_signal.get("action") == "open" and action == "open":
+        await update_positions_async(signal)
+    elif action == "open":
         await open_position_async(signal)
     elif action == "close":
         await close_positions_async(signal.get("symbol", "XAUUSD"))
     else:
         logger.debug("No actionable trade signal detected.")
+
+    _remember_message(message_id, text, signal)
+    _remember_recent_message(event.chat_id, sender_name, text, context["time"]["timestamp"])
 
 # --- Main Entry Point ---
 
@@ -361,6 +558,7 @@ if __name__ == "__main__":
         print("WARNING: Failed to connect to MetaTrader 5. Will retry on first signal.")
 
     telegram_client.add_event_handler(handler, events.NewMessage(chats=TARGET_GROUP_IDS))
+    telegram_client.add_event_handler(handler, events.MessageEdited(chats=TARGET_GROUP_IDS))
 
     try:
         telegram_client.start()
