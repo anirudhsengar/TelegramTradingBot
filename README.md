@@ -6,6 +6,7 @@ Telegram-driven MetaTrader 5 executor that listens to curated Telegram groups, u
 - Listens to specific Telegram chats only (JSON array in `TELEGRAM_GROUP_IDS`).
 - Filters likely trade messages, asks the LLM to extract `{action, symbol, side, tp, sl}`.
 - Executes `open` and `close` instructions on MT5; edits update SL/TP for existing bot trades.
+- Trades are rejected if SL or TP is missing/zero; both are mandatory for every order/update.
 - Ignores stale messages (>120s) and deduplicates repeated text.
 - Keeps a small context window of recent chat messages and current bot positions for better LLM parsing.
 
@@ -66,6 +67,7 @@ It opens a tiny market order on `TEST_SYMBOL` (default `XAUUSD`) and closes it a
 
 ## Behavior notes
 - Fixed volume: `0.01` lots; slippage tolerance: `20` points.
+- SL/TP required: trades without both values are skipped.
 - Stale guard: messages older than 120 seconds (after time-offset correction) are skipped.
 - Position snapshot: only bot-tagged positions (magic `234000`) are considered when building context or updating TP/SL.
 - Language hint: basic Arabic detection to help the LLM interpret content.

@@ -58,6 +58,26 @@ message_order: deque[str] = deque()
 recent_messages: dict[int, deque[dict]] = {}
 
 
+def _parse_price(value):
+    """Convert price-like inputs to float; return None when missing/invalid."""
+    if value in (None, "", 0, 0.0):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _require_sl_tp(signal):
+    """Ensure both SL and TP are provided and non-zero; log and skip otherwise."""
+    sl = _parse_price(signal.get("sl"))
+    tp = _parse_price(signal.get("tp"))
+    if sl is None or tp is None:
+        logger.warning("Trade skipped: SL and TP must both be provided and non-zero.")
+        return None, None
+    return sl, tp
+
+
 def _message_age_seconds(event) -> tuple[float, int]:
     """Compute message age accounting for Telethon's time offset if the system clock is skewed."""
     msg = getattr(event, "message", None)
@@ -162,6 +182,10 @@ def ensure_mt5_connection():
 
 def execute_trade_sync(signal):
     """Synchronous function to execute trade on MT5."""
+    sl, tp = _require_sl_tp(signal)
+    if sl is None or tp is None:
+        return
+
     if not ensure_mt5_connection():
         return
 
@@ -190,25 +214,20 @@ def execute_trade_sync(signal):
         return
 
     # Parse SL/TP (Handle 0 or None and validate against current price)
-    raw_sl = signal.get("sl")
-    raw_tp = signal.get("tp")
-    sl = float(raw_sl) if raw_sl not in (None, "", 0, 0.0) else 0.0
-    tp = float(raw_tp) if raw_tp not in (None, "", 0, 0.0) else 0.0
-
     if side == "buy":
         if sl and sl >= price:
-            logger.warning(f"SL {sl} is not below buy price {price}; dropping SL")
-            sl = 0.0
+            logger.warning(f"SL {sl} is not below buy price {price}; dropping trade request")
+            return
         if tp and tp <= price:
-            logger.warning(f"TP {tp} is not above buy price {price}; dropping TP")
-            tp = 0.0
+            logger.warning(f"TP {tp} is not above buy price {price}; dropping trade request")
+            return
     else:  # sell
         if sl and sl <= price:
-            logger.warning(f"SL {sl} is not above sell price {price}; dropping SL")
-            sl = 0.0
+            logger.warning(f"SL {sl} is not above sell price {price}; dropping trade request")
+            return
         if tp and tp >= price:
-            logger.warning(f"TP {tp} is not below sell price {price}; dropping TP")
-            tp = 0.0
+            logger.warning(f"TP {tp} is not below sell price {price}; dropping trade request")
+            return
 
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -285,18 +304,15 @@ def close_trades_sync(symbol="XAUUSD"):
 
 def update_positions_sync(signal):
     """Update SL/TP on existing positions when a Telegram message is edited."""
+    sl, tp = _require_sl_tp(signal)
+    if sl is None or tp is None:
+        return
+
     if not ensure_mt5_connection():
         return
 
     symbol = (signal.get("symbol") or "XAUUSD").upper()
     side = signal.get("side")
-
-    raw_sl = signal.get("sl")
-    raw_tp = signal.get("tp")
-
-    if raw_sl in (None, "", 0, 0.0) and raw_tp in (None, "", 0, 0.0):
-        logger.info(f"No SL/TP update provided for {symbol}; skipping")
-        return
 
     positions = mt5.positions_get(symbol=symbol)
     if not positions:
@@ -307,9 +323,6 @@ def update_positions_sync(signal):
     if not tick:
         logger.error(f"No tick data for {symbol}; cannot update positions")
         return
-
-    requested_sl = float(raw_sl) if raw_sl not in (None, "", 0, 0.0) else None
-    requested_tp = float(raw_tp) if raw_tp not in (None, "", 0, 0.0) else None
 
     updated = 0
     for pos in positions:
@@ -324,8 +337,8 @@ def update_positions_sync(signal):
 
         current_price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
 
-        target_sl = pos.sl if requested_sl is None else requested_sl
-        target_tp = pos.tp if requested_tp is None else requested_tp
+        target_sl = sl
+        target_tp = tp
 
         if pos.type == mt5.ORDER_TYPE_BUY:
             if target_sl and target_sl >= current_price:
