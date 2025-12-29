@@ -7,9 +7,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
-from azure.ai.inference import ChatCompletionsClient
-from azure.ai.inference.models import SystemMessage, UserMessage
-from azure.core.credentials import AzureKeyCredential
+from openai import OpenAI
 import MetaTrader5 as mt5
 
 # --- Configuration & Setup ---
@@ -32,9 +30,11 @@ except json.JSONDecodeError:
     logger.error("Failed to parse TELEGRAM_GROUP_IDS. Ensure it is a valid JSON array of integers.")
     TARGET_GROUP_IDS = []
 
-ENDPOINT = "https://models.github.ai/inference"
-MODEL_NAME = "microsoft/Phi-4"
-TOKEN = os.getenv("GITHUB_TOKEN")
+MODEL_NAME = "gpt-4o"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    raise SystemExit("Missing OPENAI_API_KEY in environment; add it to your .env file.")
 
 # MT5 Credentials
 MT5_LOGIN = int(os.getenv("MT5_LOGIN")) if os.getenv("MT5_LOGIN") else None
@@ -49,10 +49,7 @@ STALE_MESSAGE_SECONDS = 120  # Ignore old Telegram messages
 MAX_TRACKED_MESSAGES = 500   # Bound dedupe memory
 
 # Initialize Clients
-llm_client = ChatCompletionsClient(
-    endpoint=ENDPOINT,
-    credential=AzureKeyCredential(TOKEN),
-)
+llm_client = OpenAI(api_key=OPENAI_API_KEY)
 
 telegram_client = TelegramClient('session_name', API_ID, API_HASH)
 # Track last seen text and parsed signal per message so we can react to edits safely
@@ -403,7 +400,7 @@ def is_potential_trade_text(text: str) -> bool:
     return any(k in text_lower for k in keywords)
 
 async def parse_trade_signal(text: str, context: dict):
-    """Uses Azure AI Inference to extract structured trade data with contextual hints."""
+    """Uses OpenAI GPT-4o to extract structured trade data with contextual hints."""
     prompt = (
         "You are a financial trading assistant. Extract the trading instruction from the provided JSON context. "
         "Return ONLY a compact JSON object with no markdown formatting. "
@@ -437,12 +434,15 @@ async def parse_trade_signal(text: str, context: dict):
     try:
         user_payload = json.dumps(context, ensure_ascii=False)
         response = await asyncio.to_thread(
-            llm_client.complete,
-            messages=[SystemMessage(prompt), UserMessage(f"Context JSON:\n{user_payload}")],
+            llm_client.chat.completions.create,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": f"Context JSON:\n{user_payload}"},
+            ],
             temperature=0.1,
             top_p=0.9,
             max_tokens=200,
-            model=MODEL_NAME
+            model=MODEL_NAME,
         )
 
         content = response.choices[0].message.content or ""

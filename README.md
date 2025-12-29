@@ -1,6 +1,6 @@
 # TelegramTradingBot
 
-Telegram-driven MetaTrader 5 executor that listens to curated Telegram groups, uses the GitHub Models Phi-4 (via Azure AI Inference) to parse trade instructions, and places/updates/ closes XAUUSD trades automatically with fixed 0.01-lot sizing.
+Telegram-driven MetaTrader 5 executor that listens to curated Telegram groups, uses OpenAI GPT-4o to parse trade instructions, and places/updates/closes XAUUSD trades automatically with fixed 0.01-lot sizing.
 
 ## What it does
 - Listens to specific Telegram chats only (JSON array in `TELEGRAM_GROUP_IDS`).
@@ -13,7 +13,7 @@ Telegram-driven MetaTrader 5 executor that listens to curated Telegram groups, u
 - Python 3.10+.
 - MetaTrader 5 installed on the same machine and logged into the target broker account.
 - Telegram API credentials from https://my.telegram.org (API ID/Hash).
-- GitHub Models access token with permissions for `models.github.ai` endpoint.
+- OpenAI API key with access to `gpt-4o`.
 
 ## Setup
 1) Clone / open the repo.
@@ -28,7 +28,7 @@ Telegram-driven MetaTrader 5 executor that listens to curated Telegram groups, u
    APP_ID=123456
    APP_HASH=your_telegram_api_hash
    TELEGRAM_GROUP_IDS=[123456789,-987654321]  # JSON array of chat IDs to monitor
-   GITHUB_TOKEN=ghp_your_token_for_models
+   OPENAI_API_KEY=sk-your_openai_key
 
    MT5_LOGIN=12345678
    MT5_PASSWORD=your_mt5_password
